@@ -1,0 +1,305 @@
+---
+title: "Reds Technical Assignment"
+author: "Billy Fryer"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      message = FALSE,
+                      warning = FALSE)
+
+```
+
+```{r Question1, include = FALSE}
+################## Packages
+
+# Install Packages that aren't already installed
+# Stolen From: https://statisticsglobe.com/r-install-missing-packages-automatically
+my_packages <- c("tidyverse", "xgboost", "caret", "flextable", "ggthemes",
+                 "ggtext", "scales")
+not_installed <- my_packages[!(my_packages %in% installed.packages()[ , "Package"])]
+if(length(not_installed)) install.packages(not_installed)
+
+# Library Needed packages
+library(tidyverse)
+library(xgboost)
+library(caret)
+library(flextable)
+library(ggthemes)
+
+# Fixes a quick error message with flextable
+set_flextable_defaults(fonts_ignore=TRUE)
+
+####################### Read in data
+raw_train <- read_csv("data/train.csv")
+raw_test <- read_csv("data/test.csv")
+
+# Quick test to see if pitchers are shared between the two data sets
+test_pitchers <- raw_test$PITCHER_KEY %>% unique()
+train_pitchers <- raw_train$PITCHER_KEY %>% unique()
+test_pitchers %in% train_pitchers # All Falses
+rm(test_pitchers, train_pitchers)
+# No which means that I shouldn't include PITCHER_KEY in the model I create
+# After looking in data dictionary, don't want to use UID either
+
+
+selected_train <- raw_train %>% 
+  # Get rid of those 2 variables out of the train data set
+  select(-c(PITCHER_KEY, UID)) %>% 
+  # Convert PITCH_TYPE_TRACKED_KEY to numeric
+  mutate(PITCH_TYPE_TRACKED_KEY = case_when(
+    PITCH_TYPE_TRACKED_KEY == 'SI' ~ 0,
+    PITCH_TYPE_TRACKED_KEY == "FB" ~ 1,
+    PITCH_TYPE_TRACKED_KEY == "CF" ~ 2,
+    PITCH_TYPE_TRACKED_KEY == "CB" ~ 3,
+    PITCH_TYPE_TRACKED_KEY == "SL" ~ 4,
+    PITCH_TYPE_TRACKED_KEY == "CH" ~ 5))
+
+# Separate data from label
+data_variables <- selected_train %>% 
+  select(-PITCH_TYPE_TRACKED_KEY) %>% 
+  as.matrix()
+data_label <- selected_train$PITCH_TYPE_TRACKED_KEY
+
+# 60/40 Train/Test Split
+n <- nrow(data_variables)
+prop <- 0.6
+set.seed(119)
+train_index <- sample(n, size = n * prop)
+# split train data and make xgb.DMatrix
+train_data   <- data_variables[train_index,]
+train_label  <- data_label[train_index]
+train_matrix <- xgb.DMatrix(data = train_data,
+                            label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- data_variables[-train_index,]
+test_label <- data_label[-train_index]
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+
+############################### Modeling
+# xgboost is a great a way to get reduce log loss big time
+# Haven't done multiple classification xgboost before
+# so I got help from https://rpubs.com/mharris/multiclass_xgboost
+numberOfClasses <- unique(data_label) %>% length()
+xgb_params <- list("objective" = "multi:softprob",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses)
+nround    <- 50 # number of XGBoost rounds
+cv.nfold  <- 5 # 5 Rounds of Cross Validation
+
+# Fit cv.nfold * cv.nround XGB models and save OOF predictions
+cv_model <- xgb.cv(params = xgb_params,
+                   data = train_matrix,
+                   nrounds = nround,
+                   nfold = cv.nfold,
+                   verbose = FALSE,
+                   prediction = TRUE)
+
+# Check out predictions
+OOF_prediction <- data.frame(cv_model$pred) %>%
+  # Compute which column has highest probability
+  mutate(max_prob = max.col(., ties.method = "last"),
+         # Train label + 1 is the pitch type
+         # R doesn't do colmn x0 so it increases everything by 1
+         label = train_label + 1) %>%
+  # Convert back to pitch types
+  mutate(max_prob = case_when(
+    max_prob == 1 ~ 'SI',
+    max_prob == 2 ~ "FB",
+    max_prob == 3 ~ "CF",
+    max_prob == 4 ~ "CB",
+    max_prob == 5 ~ "SL",
+    max_prob == 6 ~ "CH"),
+    label = case_when(
+      label == 1 ~ 'SI',
+      label == 2 ~ "FB",
+      label == 3 ~ "CF",
+      label == 4 ~ "CB",
+      label == 5 ~ "SL",
+      label == 6 ~ "CH"),
+    )
+
+#head(OOF_prediction)
+
+# Confusion matrix
+confusionMatrix(factor(OOF_prediction$max_prob),
+                factor(OOF_prediction$label),
+                mode = "everything")
+# Doesn't do the best with CF or SI, but mixes them up with FB
+# So we can live with that I guess
+
+
+########## Holdout Data
+# Predict hold-out test set
+bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,
+                       nrounds = nround)
+# Predict based on test_matrix
+test_pred <- predict(bst_model, newdata = test_matrix)
+test_prediction <- matrix(test_pred, nrow = numberOfClasses,
+                          ncol=length(test_pred)/numberOfClasses) %>%
+  t() %>%
+  data.frame() %>%
+  mutate(label = test_label + 1,
+         max_prob = max.col(., "last")) %>%
+  # Convert back to pitch types
+  mutate(max_prob = case_when(
+    max_prob == 1 ~ 'SI',
+    max_prob == 2 ~ "FB",
+    max_prob == 3 ~ "CF",
+    max_prob == 4 ~ "CB",
+    max_prob == 5 ~ "SL",
+    max_prob == 6 ~ "CH"),
+    label = case_when(
+      label == 1 ~ 'SI',
+      label == 2 ~ "FB",
+      label == 3 ~ "CF",
+      label == 4 ~ "CB",
+      label == 5 ~ "SL",
+      label == 6 ~ "CH"),
+    )
+
+# confusion matrix of test set
+confusionMatrix(factor(test_prediction$max_prob),
+                factor(test_prediction$label),
+                mode = "everything")
+# Same as before doesn't do the best with CF or SI
+# but mixes them up with FB which we can live with
+
+
+########## Predict raw_test data
+
+# Make raw_test into proper matrices
+# split train data and make xgb.DMatrix
+final_test_matrix <- raw_test %>% 
+  select(RELEASE_SIDE, SPIN_RATE_ABSOLUTE, RELEASE_HEIGHT, RELEASE_SPEED) %>% 
+  as.matrix()
+
+colnames(final_test_matrix)<- colnames(train_matrix)
+
+test_pred <- predict(bst_model, newdata = final_test_matrix)
+final_prediction <- matrix(test_pred, nrow = numberOfClasses,
+                          ncol=length(test_pred)/numberOfClasses) %>%
+  t() %>%
+  data.frame()
+
+names(final_prediction) <- c("SI", "FB", "CF", "CB", "SL", "CH")
+
+output_csv <- bind_cols(UID = raw_test$UID, final_prediction) %>%
+  # Reorder columns
+  select(UID, CB, CF, CH, FB, SI, SL)
+
+write.csv(x = output_csv,
+          file = "data/solution.csv",
+          row.names = FALSE)
+
+# Clear environment for part 2
+rm(list = ls())
+```
+
+```{r Part2-table1}
+# Read in Test Data
+test_data <- read_csv("data/test.csv")
+
+# First thing I'm going to do is look at results by pitcher
+# specifically where each pitcher generates strikes and bad contact
+# Do this in percent
+strikes_contact_by_pitcher <- test_data %>% 
+  # Converted to character since it's a name
+  group_by(PITCHER_KEY) %>% 
+  # Summarize by contact type/strike result
+  # Strikes / All No Contact
+  summarise(S_RATE = sum(S, na.rm = TRUE) / n(),
+            # Swinging Strikes / All Pitches not put in play
+            SS_RATE = sum(SS, na.rm = TRUE) / n(),
+            # Bad Contact / All Contact
+            BAD_CONTACT_RATE = sum(CONTACT_QUALITY == 'bad', na.rm = TRUE) / 
+              sum(!is.na(CONTACT_QUALITY))
+            ) %>% 
+  ungroup() %>% 
+  # Convert Pitcher to Character
+  mutate(PITCHER_KEY = as.character(PITCHER_KEY)) %>% 
+  arrange(-SS_RATE)
+  
+# Table time
+strikes_contact_by_pitcher %>% 
+  
+  flextable() %>% 
+  align(align = "center",
+        part = "all") %>% 
+  set_header_labels(values = list(
+    PITCHER_KEY = "Pitcher",
+    S_RATE = "Strike Rate",
+    SS_RATE = "Swining Strike Rate",
+    BAD_CONTACT_RATE = "Poor Contact Rate")
+    ) %>%
+  # Color Columns and text
+  bg(j = "S_RATE",
+     bg = scales::col_numeric(palette = "Reds", 
+                              domain = c(0.45, 0.51))) %>% 
+  color(j = "S_RATE",
+     color = "black") %>% 
+  bg(j = "SS_RATE",
+     bg = scales::col_numeric(palette = "Reds", 
+                              domain = c(0.10, 0.15))) %>% 
+  color(j = "SS_RATE",
+     color = "black") %>%
+  bg(j = "BAD_CONTACT_RATE",
+     bg = scales::col_numeric(palette = "Reds", 
+                              domain = c(0.55, 0.65))) %>% 
+  color(j = "BAD_CONTACT_RATE",
+     color = "black")%>%
+  # Percent Formats
+  set_formatter(S_RATE = function(x) sprintf("%.1f%%",  x*100)) %>% 
+  set_formatter(SS_RATE = function(x) sprintf("%.1f%%", x*100)) %>% 
+  set_formatter(BAD_CONTACT_RATE = function(x) sprintf("%.1f%%", x*100)) %>%
+  colformat_int(j = "PITCHER_KEY")
+```
+
+```{r speed-spin}
+ggplot(test_data, aes(x = RELEASE_SPEED,
+                      y = SPIN_RATE_ABSOLUTE)) +
+  geom_point() +
+  scale_color_discrete() +
+  facet_wrap(~PITCHER_KEY,
+             nrow = 1) +
+  labs(x = "Velocity",
+       y = "Spin Rate",
+       title = "Velocity by Spin Rate") +
+  theme_foundation() +
+  theme(axis.title = element_text(face = "bold"),
+        panel.grid = element_blank(),
+        plot.title = ggtext::element_markdown(hjust = 0.5,
+                                              size = 14,
+                                              face = "bold"),
+        plot.subtitle = ggtext::element_markdown(hjust = 0.5,
+                                                 size = 8,
+                                                 face = "italic")
+  )
+```
+
+\newpage
+
+My preferred order of these Pitchers would be:
+
+**1) Pitcher 90002**
+
+Pitcher 90002 had the highest Strike Rate and Swinging Strike Rate out of the 5 pitchers. This helps make up for the fact that he ranked fourth in Poor Contact Rate (the percentage of times poor contact was made by the hitter compared to all the times contact was made). This was the overall difference between pitchers 90004 and 90002 for me. From the graph, his velocity is elite as well as enhanced even further by his change in velocity between the fastball and the off speed and breaking pitches.
+
+**2) Pitcher 90004**
+
+For me, comparing pitchers 90004 and 90002 was the toughest. Pitcher 9004 has the third highest Strike and Swinging Strike Rates. However, Pitcher 90004 does very well at drawing weak contact, the best of all the pitchers in the data set. He's good enough to be elusive to draw swings and misses/ get strikes called but even when contact is made, it's not strong contact. The difference for me ended up being that Pitcher 90002 consistently threw the ball harder
+
+**3) Pitcher 90000**
+
+Pitcher 90000 has the second highest Strike Rate of all the pitchers in the test set, but what makes him really interesting is that his Swinging Strike Rate is nearly equal to Pitcher 90002 while his fastest pitches are a little bit slower. Although when he is hit he is hit hard, his high breaking pitch helps keep hitters off balance enough for that not to be as big of an issue.
+
+**4) Pitcher 90001**
+
+The biggest thing going for Pitcher 90001 is that he has the second highest Poor Contact Rate out of all the pitchers in the data set. His Strike Rate is below 50% which means he throws more balls than strikes on balls not hit. His peak velocity isn't that high either, maxing out around 95.5 mph. Looking at his Velocity by Spin Rate plot, he appears to throw 4 different pitches.
+
+**5) Pitcher 90003**
+
+Pitcher 9003 was consistently in the lower ranks across all three metrics. In addition, while looking at his Velocity vs Spin Rate graph, there were a few pitches that spin rates really close to 0. These of course be due to mistakes in the data but if that's a real pitch such as a knuckle ball that could be interesting to look into further.
